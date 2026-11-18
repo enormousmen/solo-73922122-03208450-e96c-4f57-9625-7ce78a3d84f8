@@ -400,3 +400,283 @@ def test_path_traversal_rejected(proxy):
     with client() as c:
         r = c.get(f"{proxy.url}/packages/..%2f..%2fetc%2fpasswd")
     assert r.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------- #
+# range / resume tests                                                   #
+# --------------------------------------------------------------------- #
+
+def range_get(base: str, path: str, range_header: str, if_range: str | None = None):
+    headers = {"Range": range_header}
+    if if_range is not None:
+        headers["If-Range"] = if_range
+    with client() as c:
+        return c.get(f"{base}/packages/{path}", headers=headers)
+
+
+def test_full_download_advertises_strong_etag_and_accept_ranges(proxy, origin):
+    origin_reset(origin.url)
+    with client() as c:
+        r = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+    assert r.status_code == 200
+    digest = origin_stats(origin.url)["packages"][PKG_SMALL]["sha256"]
+    assert r.headers["x-package-sha256"] == digest
+    assert r.headers["etag"] == f'"{digest}"'
+    assert not r.headers["etag"].startswith("W/")  # strong validator
+    assert r.headers["accept-ranges"] == "bytes"
+
+
+def test_range_206_on_cache_hit_exact_bytes(proxy, origin):
+    origin_reset(origin.url)
+    body = download_bytes(proxy.url, PKG_SMALL)
+    size = len(body)
+    digest = origin_stats(origin.url)["packages"][PKG_SMALL]["sha256"]
+
+    r = range_get(proxy.url, PKG_SMALL, "bytes=100-199")
+    assert r.status_code == 206
+    assert r.headers["content-range"] == f"bytes 100-199/{size}"
+    assert r.headers["content-length"] == "100"
+    assert r.content == body[100:200]
+    assert r.headers["etag"] == f'"{digest}"'
+    assert r.headers["x-cache"] == "HIT"
+    assert origin_stats(origin.url)["paths"][PKG_SMALL] == 1  # served from cache
+
+    # Open-ended range runs to the final byte.
+    r = range_get(proxy.url, PKG_SMALL, "bytes=100-")
+    assert r.status_code == 206
+    assert r.headers["content-range"] == f"bytes 100-{size - 1}/{size}"
+    assert r.content == body[100:]
+
+    # An end past the object is clipped to the last byte.
+    r = range_get(proxy.url, PKG_SMALL, f"bytes={size - 50}-{size + 9999}")
+    assert r.status_code == 206
+    assert r.headers["content-range"] == f"bytes {size - 50}-{size - 1}/{size}"
+    assert r.content == body[size - 50:]
+
+
+def test_range_past_end_returns_416_with_total_length(proxy, origin):
+    body = download_bytes(proxy.url, PKG_SMALL)
+    size = len(body)
+    r = range_get(proxy.url, PKG_SMALL, f"bytes={size}-")
+    assert r.status_code == 416
+    assert r.headers["content-range"] == f"bytes */{size}"
+    assert r.headers["accept-ranges"] == "bytes"
+    # The version identifier is still advertised on the error response.
+    assert "etag" in r.headers
+
+
+def test_unsupported_range_syntax_is_ignored_full_200(proxy, origin):
+    body = download_bytes(proxy.url, PKG_SMALL)
+    for bad in ("bytes=0-100,200-300", "items=0-100", "bytes=-100", "bytes=100-50"):
+        r = range_get(proxy.url, PKG_SMALL, bad)
+        assert r.status_code == 200, bad
+        assert r.content == body, bad
+        assert "content-range" not in r.headers
+
+
+def test_if_range_match_206_mismatch_full_200(proxy, origin):
+    origin_reset(origin.url)
+    with client() as c:
+        r0 = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+    body, etag, size = r0.content, r0.headers["etag"], len(r0.content)
+
+    # Matching validator: exact resume.
+    r = range_get(proxy.url, PKG_SMALL, f"bytes={size - 100}-", etag)
+    assert r.status_code == 206
+    assert r.content == body[size - 100:]
+    assert r.headers["etag"] == etag
+
+    # Stale validator: restart from byte 0 with the current version.
+    r = range_get(proxy.url, PKG_SMALL, f"bytes={size - 100}-", '"deadbeef-stale"')
+    assert r.status_code == 200
+    assert r.content == body
+    assert r.headers["content-length"] == str(size)
+
+    # The origin version actually changes: old validator now yields the new
+    # package in full so the client replaces everything it had downloaded.
+    with client() as c:
+        new = c.post(f"{origin.url}/control/content/{PKG_SMALL}").json()
+        c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+    r = range_get(proxy.url, PKG_SMALL, "bytes=0-99", etag)
+    assert r.status_code == 200
+    assert len(r.content) == new["size"]
+    assert sha256(r.content) == new["sha256"]
+
+
+def test_resume_after_interrupted_download(proxy, origin):
+    # Slow fill so the first download can be abandoned mid-body.
+    set_behavior(origin.url, delay_ms=30, chunk_size=64 * 1024)  # ~0.5s fill
+    try:
+        origin_reset(origin.url)
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+
+        got = 0
+        with client(timeout_read=30).stream(
+            "GET", f"{proxy.url}/packages/{PKG_SMALL}"
+        ) as r:
+            assert r.status_code == 200
+            etag = r.headers["etag"]
+            for chunk in r.iter_bytes(64 * 1024):
+                got += len(chunk)
+                if got >= 300_000:
+                    break
+        n = got
+
+        # The single-flight fill keeps running; wait for it to finish.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            with client() as c:
+                state = c.get(f"{proxy.url}/cache/status").json().get(PKG_SMALL, {})
+            if state.get("state") == "complete":
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("background fill did not complete")
+
+        # Open-ended resume from the interruption point.
+        r = range_get(proxy.url, PKG_SMALL, f"bytes={n}-", etag)
+        assert r.status_code == 206
+        size = origin_stats(origin.url)["packages"][PKG_SMALL]["size"]
+        assert r.headers["content-range"] == f"bytes {n}-{size - 1}/{size}"
+        assert len(r.content) == size - n
+
+        # Bounded single range from the same point.
+        r2 = range_get(proxy.url, PKG_SMALL, f"bytes={n}-{n + 999}", etag)
+        assert r2.status_code == 206
+        assert len(r2.content) == 1000
+
+        # Reassembled bytes are byte-identical to the origin package.
+        with client() as c:
+            full = c.get(f"{proxy.url}/packages/{PKG_SMALL}").content
+        assert r.content == full[n:]
+        assert r2.content == full[n:n + 1000]
+        assert sha256(full) == origin_stats(origin.url)["packages"][PKG_SMALL]["sha256"]
+        # The resume never went back to the origin: one fill served everyone.
+        assert origin_stats(origin.url)["paths"][PKG_SMALL] == 1
+    finally:
+        set_behavior(origin.url)
+
+
+def test_range_miss_waits_for_single_flight_fill(proxy, origin):
+    # A range on a miss must wait for the fill, not answer from a half file.
+    set_behavior(origin.url, delay_ms=60, chunk_size=64 * 1024)  # ~1s fill
+    try:
+        origin_reset(origin.url)
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+
+        result: dict = {}
+
+        def full_download():
+            result["full"] = download_bytes(proxy.url, PKG_SMALL)
+
+        t = threading.Thread(target=full_download)
+        t.start()
+        time.sleep(0.25)  # the single fill is in flight
+
+        def one_range(i):
+            return range_get(proxy.url, PKG_SMALL, f"bytes={500_000 + i}-")
+
+        t0 = time.monotonic()
+        with ThreadPoolExecutor(4) as ex:
+            ranges = list(ex.map(one_range, range(4)))
+        elapsed = time.monotonic() - t0
+        t.join(30)
+
+        body = result["full"]
+        assert elapsed > 0.5, "range answered before the fill completed"
+        for i, r in enumerate(ranges):
+            assert r.status_code == 206
+            assert r.headers["content-range"].endswith(f"/{len(body)}")
+            assert r.content == body[500_000 + i:]
+        assert origin_stats(origin.url)["total_hits"] == 1  # one shared fill
+    finally:
+        set_behavior(origin.url)
+
+
+def test_range_on_failed_fill_returns_error_and_no_package_bytes(proxy, origin):
+    set_behavior(origin.url, delay_ms=30, chunk_size=64 * 1024, truncate=200_000)
+    try:
+        origin_reset(origin.url)
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+        r = range_get(proxy.url, PKG_SMALL, "bytes=100-", '"old-version"')
+        assert r.status_code == 502
+        assert "origin fetch failed" in r.text
+        assert len(r.content) < 200  # error text only, zero package bytes
+        # No half package is cached anywhere.
+        leftovers = [
+            p for p in proxy.cache_dir.rglob("*")
+            if p.is_file() and PKG_SMALL in p.name
+        ]
+        assert leftovers == [], leftovers
+        assert origin_stats(origin.url)["total_hits"] == 1
+    finally:
+        set_behavior(origin.url)
+
+
+def test_purge_during_fill_resume_reads_old_generation_new_reads_new(proxy, origin):
+    # Prime generation 0 and remember its bytes/version.
+    origin_reset(origin.url)
+    body1 = download_bytes(proxy.url, PKG_SMALL)
+    etag1 = None
+    with client() as c:
+        etag1 = c.get(f"{proxy.url}/packages/{PKG_SMALL}").headers["etag"]
+    n = 400_000
+
+    set_behavior(origin.url, delay_ms=60, chunk_size=64 * 1024)  # ~1s per fill
+    try:
+        # Purge #1: R1 triggers generation 1 (still the v1 origin content).
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+        r1_holder = {}
+
+        def resume_r1():
+            r1_holder["r"] = range_get(proxy.url, PKG_SMALL, f"bytes={n}-", etag1)
+
+        t1 = threading.Thread(target=resume_r1)
+        t1.start()
+        time.sleep(0.3)  # R1 is accepted on generation 1 mid-fill
+
+        # Origin rolls a new version while generation 1 is still streaming.
+        with client() as c:
+            new = c.post(f"{origin.url}/control/content/{PKG_SMALL}").json()
+
+        # Purge #2: generation 1 is closed but kept for R1; R2 starts
+        # generation 2, which fetches the new content.
+        with client() as c:
+            c.post(f"{proxy.url}/purge/{PKG_SMALL}")
+
+        r2_holder = {}
+
+        def resume_r2():
+            r2_holder["r"] = range_get(proxy.url, PKG_SMALL, f"bytes={n}-")
+
+        t2 = threading.Thread(target=resume_r2)
+        t2.start()
+        t1.join(30)
+        t2.join(30)
+        r1 = r1_holder["r"]
+        r2 = r2_holder["r"]
+
+        # R1 finished on the old generation it had attached to.
+        assert r1.status_code == 206
+        assert r1.headers["etag"] == etag1
+        assert r1.content == body1[n:]
+
+        # New requests read the new generation.
+        assert r2.status_code == 206
+        assert r2.headers["etag"] == f'"{new["sha256"]}"'
+        body2 = download_bytes(proxy.url, PKG_SMALL)  # HIT on generation 2
+        assert r2.content == body2[n:]
+        assert sha256(body2) == new["sha256"]
+        assert body2 != body1
+
+        # Three origin fetches: prime + generation 1 + generation 2.
+        assert origin_stats(origin.url)["paths"][PKG_SMALL] == 3
+        # Old generation files were reaped once its last reader left.
+        parts = [p for p in proxy.cache_dir.rglob("*") if ".part-" in p.name]
+        assert parts == [], parts
+    finally:
+        set_behavior(origin.url)
